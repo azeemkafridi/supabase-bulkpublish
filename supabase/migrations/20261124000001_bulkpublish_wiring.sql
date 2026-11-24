@@ -67,10 +67,19 @@ end;
 $$;
 
 drop trigger if exists bulkpublish_posts_on_ready on public.bulkpublish_posts;
-create trigger bulkpublish_posts_on_ready
-  after insert or update of status on public.bulkpublish_posts
+drop trigger if exists bulkpublish_posts_on_insert on public.bulkpublish_posts;
+create trigger bulkpublish_posts_on_insert
+  after insert on public.bulkpublish_posts
   for each row
   when (new.status = 'ready')
+  execute function public.bulkpublish_on_ready();
+
+-- Rows the function hands back after a passing error are 'retrying', not
+-- 'ready', so they wait for the once-a-minute run instead of calling straight back.
+create trigger bulkpublish_posts_on_ready
+  after update of status on public.bulkpublish_posts
+  for each row
+  when (new.status = 'ready' and old.status is distinct from 'ready')
   execute function public.bulkpublish_on_ready();
 
 -- Once a minute: publish rows the trigger missed and read back results.

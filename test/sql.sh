@@ -88,6 +88,42 @@ eq "$("${P[@]}" -c "select count(*) from bulkpublish_due_checks(20)")" 0 "leased
 eq "$("${P[@]}" -c "select status from bulkpublish_posts where id = 6")" failed "stranded row"
 eq "$("${P[@]}" -c "select status from bulkpublish_posts where id = 1")" posting "fresh posting row untouched"
 
+# A finished row set to 'ready' again starts afresh: old post id and URLs are
+# cleared on claim, attempts reset, and the trigger fires.
+"${P[@]}" -c "update bulkpublish_posts set status = 'posted', bulkpublish_post_id = 103, post_urls = '[{\"url\":\"u\"}]', attempts = 3 where id = 3"
+"${P[@]}" -c "update bulkpublish_posts set status = 'ready' where id = 3"
+eq "$("${P[@]}" -c "select attempts from bulkpublish_posts where id = 3")" 0 "attempts reset by user"
+eq "$("${P[@]}" -c "select count(*) from net.calls where body->>'id' = '3'")" 2 "re-ready fires trigger (1 from its insert)"
+eq "$("${P[@]}" -c "select coalesce(bulkpublish_post_id::text, 'null'), post_urls::text, attempts from bulkpublish_claim(3, 1)")" "null|[]|1" "claim clears previous run"
+
+# A claimed row is leased: not read back while the function works on it.
+eq "$("${P[@]}" -c "select next_check_at > now() + interval '14 minutes' from bulkpublish_posts where id = 3")" t "claim lease"
+
+# The function handing a row back as 'retrying' keeps its count, does not
+# re-fire the trigger, and the next claim takes it.
+"${P[@]}" -c "update bulkpublish_posts set status = 'retrying' where id = 3"
+eq "$("${P[@]}" -c "select attempts from bulkpublish_posts where id = 3")" 1 "retry keeps attempts"
+eq "$("${P[@]}" -c "select count(*) from net.calls where body->>'id' = '3'")" 2 "retry does not re-fire"
+eq "$("${P[@]}" -c "select attempts from bulkpublish_claim(null, 1)")" 2 "second attempt counted"
+
+# A row already sent cannot be set to 'ready' (it would be a second post);
+# going through 'draft' first is the deliberate way to send it again.
+for st in posting scheduled pending_approval retrying; do
+  "${P[@]}" -c "update bulkpublish_posts set status = '$st', bulkpublish_post_id = 103 where id = 3"
+  if "${P[@]}" -c "update bulkpublish_posts set status = 'ready' where id = 3" 2>/dev/null; then fail "ready from $st allowed"; fi
+done
+"${P[@]}" -c "update bulkpublish_posts set status = 'draft' where id = 3"
+"${P[@]}" -c "update bulkpublish_posts set status = 'ready' where id = 3"
+eq "$("${P[@]}" -c "select status from bulkpublish_posts where id = 3")" ready "ready via draft"
+
+# Rows that never settle stop being followed after 14 days, unless their own
+# time is still ahead.
+"${P[@]}" -c "update bulkpublish_posts set status = 'pending_approval', bulkpublish_post_id = 104, claimed_at = now() - interval '15 days', next_check_at = now() + interval '1 hour' where id = 4"
+"${P[@]}" -c "update bulkpublish_posts set status = 'pending_approval', bulkpublish_post_id = 105, claimed_at = now() - interval '15 days', scheduled_at = now() + interval '3 days', next_check_at = now() + interval '1 hour' where id = 5"
+"${P[@]}" -c "select count(*) from bulkpublish_due_checks(20)" >/dev/null
+eq "$("${P[@]}" -c "select status from bulkpublish_posts where id = 4")" failed "14-day stop"
+eq "$("${P[@]}" -c "select status from bulkpublish_posts where id = 5")" pending_approval "future time not stopped"
+
 # updated_at moves on update; bad statuses are refused.
 eq "$("${P[@]}" -c "select updated_at > created_at from bulkpublish_posts where id = 2")" t "updated_at"
 if "${P[@]}" -c "update bulkpublish_posts set status = 'published' where id = 2" 2>/dev/null; then fail "status check"; fi
@@ -97,5 +133,6 @@ eq "$("${P[@]}" -c "select has_function_privilege('anon', 'public.bulkpublish_cl
 eq "$("${P[@]}" -c "select has_function_privilege('authenticated', 'public.bulkpublish_invoke(jsonb)', 'execute')")" f "authenticated invoke"
 eq "$("${P[@]}" -c "select has_function_privilege('service_role', 'public.bulkpublish_due_checks(int)', 'execute')")" t "service_role checks"
 eq "$("${P[@]}" -c "select relrowsecurity from pg_class where relname = 'bulkpublish_posts'")" t "RLS on"
+eq "$("${P[@]}" -c "select has_table_privilege('service_role', 'public.bulkpublish_posts', 'update')")" t "service_role table grant"
 
 echo "sql: all checks passed"

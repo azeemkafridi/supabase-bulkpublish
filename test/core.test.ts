@@ -5,6 +5,11 @@ import {
   BulkPublishError,
   buildPostBody,
   checkCharLimits,
+  effectiveSchedule,
+  isTransient,
+  nextUtcMidnight,
+  serverKey,
+  needsChannelSets,
   outcomeFor,
   parseMediaRef,
   resolveChannels,
@@ -66,7 +71,8 @@ test("row validation", () => {
   assert.doesNotThrow(() => validateRow(base, now));
   assert.throws(() => validateRow({ ...base, caption: "  " }, now), /Caption is empty/);
   assert.throws(() => validateRow({ ...base, channels: [" "] }, now), /No channels/);
-  assert.throws(() => validateRow({ ...base, scheduled_at: "2026-11-24T11:00:00Z" }, now), /in the past/);
+  // A time already passed is not an error: the row was picked up late.
+  assert.doesNotThrow(() => validateRow({ ...base, scheduled_at: "2026-11-24T11:00:00Z" }, now));
   assert.throws(() => validateRow({ ...base, scheduled_at: "soon" }, now), /not a valid time/);
 });
 
@@ -78,6 +84,8 @@ test("media refs: storage paths and URLs", () => {
   const u = parseMediaRef("https://cdn.example.com/a%20b.jpg?x=1");
   assert.equal(u.kind, "url");
   assert.equal(u.filename, "a b.jpg");
+  assert.deepEqual(parseMediaRef("bulkpublish:1234"), { kind: "library", id: 1234 });
+  assert.throws(() => parseMediaRef("bulkpublish:abc"), RowError);
   assert.throws(() => parseMediaRef("ftp://x/y.png"), RowError);
   assert.throws(() => parseMediaRef("hero.png"), RowError);
 });
@@ -141,10 +149,13 @@ test("outcome: all failed → failed with each error", () => {
   assert.match(u.result || "", /x FAILED: Duplicate/);
 });
 
-test("outcome: still publishing → check again shortly", () => {
-  const u = outcomeFor({ id: 7, status: "publishing", postPlatforms: [{ platform: "x", status: "publishing" }] }, now);
+test("outcome: still publishing → check again shortly, then less often", () => {
+  const post = { id: 7, status: "publishing", postPlatforms: [{ platform: "x", status: "publishing" }] };
+  const u = outcomeFor(post, now);
   assert.equal(u.status, "posting");
   assert.equal(u.next_check_at, "2026-11-24T12:00:30.000Z");
+  assert.equal(outcomeFor(post, now, "2026-11-24T11:40:00Z").next_check_at, "2026-11-24T12:05:00.000Z");
+  assert.equal(outcomeFor(post, now, "2026-11-24T09:00:00Z").next_check_at, "2026-11-24T12:30:00.000Z");
 });
 
 test("outcome: failed post with no destinations settles instead of looping", () => {
@@ -166,6 +177,11 @@ test("outcome: approval pending, rejected, approved too late", () => {
   const late = outcomeFor({ id: 7, status: "draft", approvalStatus: "approved" }, now);
   assert.equal(late.status, "failed");
   assert.match(late.result || "", /new time/);
+  assert.match(outcomeFor({ id: 7, status: "draft", approvalStatus: "none" }, now).result || "", /is a draft/);
+  assert.equal(
+    outcomeFor({ id: 7, status: "scheduled", approvalStatus: "pending" }, now).next_check_at,
+    "2026-11-24T13:00:00.000Z",
+  );
 });
 
 test("client: bearer auth, JSON body, API errors carry status and code", async () => {
@@ -214,4 +230,40 @@ test("secret compare", () => {
   assert.equal(safeEqual("abc", "abd"), false);
   assert.equal(safeEqual("abc", "abcd"), false);
   assert.equal(safeEqual("", "x"), false);
+});
+
+test("passing errors are retried; the daily allowance and row problems are not", () => {
+  assert.equal(isTransient(new BulkPublishError("x", 429, "RATE_LIMITED")), true);
+  assert.equal(isTransient(new BulkPublishError("x", 503)), true);
+  assert.equal(isTransient(new TypeError("fetch failed")), true);
+  assert.equal(isTransient(new BulkPublishError("x", 429, "DAILY_QUOTA_EXCEEDED")), false);
+  assert.equal(isTransient(new BulkPublishError("x", 400)), false);
+  assert.equal(isTransient(new RowError("bad row")), false);
+});
+
+test("channel sets are fetched only when a value is not a channel", () => {
+  assert.equal(needsChannelSets(["x", "Acme Inc", "1", " "], channels), false);
+  assert.equal(needsChannelSets(["x", "Launch"], channels), true);
+  // An inactive channel's platform is not a match, so sets are looked at too.
+  assert.equal(needsChannelSets(["instagram"], channels), true);
+});
+
+test("a passed schedule publishes now", () => {
+  const now = Date.parse("2026-11-24T12:00:00Z");
+  assert.equal(effectiveSchedule(null, now), null);
+  assert.equal(effectiveSchedule("2026-11-24T11:59:00Z", now), null);
+  assert.equal(effectiveSchedule("2026-11-24T12:01:00Z", now), "2026-11-24T12:01:00Z");
+});
+
+test("daily allowance: next check after midnight UTC", () => {
+  assert.equal(nextUtcMidnight(Date.parse("2026-11-24T23:30:00Z")), "2026-11-25T00:01:00.000Z");
+  assert.equal(nextUtcMidnight(Date.parse("2026-11-30T05:00:00Z")), "2026-12-01T00:01:00.000Z");
+});
+
+test("database key: new secret keys first, legacy key as fallback", () => {
+  const from = (vars: Record<string, string>) => (n: string) => vars[n];
+  assert.equal(serverKey(from({ SUPABASE_SECRET_KEYS: '{"default":"sb_secret_a"}', SUPABASE_SERVICE_ROLE_KEY: "legacy" })), "sb_secret_a");
+  assert.equal(serverKey(from({ SUPABASE_SECRET_KEYS: '{"other":"sb_secret_b"}' })), "sb_secret_b");
+  assert.equal(serverKey(from({ SUPABASE_SECRET_KEYS: "not json", SUPABASE_SERVICE_ROLE_KEY: "legacy" })), "legacy");
+  assert.equal(serverKey(from({})), null);
 });

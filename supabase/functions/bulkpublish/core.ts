@@ -36,6 +36,8 @@ export interface QueueRow {
   discord_channel: string | null;
   status: string;
   bulkpublish_post_id: number | null;
+  attempts?: number;
+  claimed_at?: string | null;
 }
 
 /** The columns the function writes back to a row. */
@@ -171,6 +173,36 @@ export const CHAR_LIMITS: Record<string, number> = {
 /** A problem with the row itself: written back as-is, nothing was sent. */
 export class RowError extends Error {}
 
+/** How many times a row is tried when the error is a passing one. */
+export const MAX_ATTEMPTS = 5;
+
+/**
+ * Worth trying again in a minute: too many requests in the last minute, a
+ * server error, or no answer at all. The daily request allowance is not: it
+ * resets at midnight UTC, so retrying only fails the same way.
+ */
+export function isTransient(err: unknown): boolean {
+  if (err instanceof RowError) return false;
+  if (err instanceof BulkPublishError) {
+    if (err.code === "DAILY_QUOTA_EXCEEDED") return false;
+    return err.status === 429 || err.status >= 500;
+  }
+  return err instanceof TypeError; // fetch's network failure
+}
+
+/** Is any value in the row's channels list not a channel id, platform or account name? */
+export function needsChannelSets(values: string[], channels: Channel[]): boolean {
+  const active = channels.filter((c) => c.isActive !== false);
+  return values.some((raw) => {
+    const lower = String(raw).trim().toLowerCase();
+    if (!lower) return false;
+    return !active.some((c) =>
+      String(c.id) === lower || (c.platform || "").toLowerCase() === lower ||
+      (c.accountName || "").toLowerCase() === lower
+    );
+  });
+}
+
 /**
  * Resolve the row's `channels` values against the account's channels.
  * Each value may be a channel id, a platform name (every active channel on
@@ -254,22 +286,34 @@ export function validateRow(row: QueueRow, now = Date.now()): void {
   if (!row.channels || !row.channels.some((c) => String(c).trim())) {
     throw new RowError("No channels. Add at least one platform, account name or channel id to channels.");
   }
-  if (row.scheduled_at) {
-    const t = Date.parse(row.scheduled_at);
-    if (Number.isNaN(t)) throw new RowError(`scheduled_at "${row.scheduled_at}" is not a valid time.`);
-    if (t <= now) {
-      throw new RowError("scheduled_at is in the past. Clear it to publish now, or choose a future time.");
-    }
+  if (row.scheduled_at && Number.isNaN(Date.parse(row.scheduled_at))) {
+    throw new RowError(`scheduled_at "${row.scheduled_at}" is not a valid time.`);
   }
+}
+
+/**
+ * The time to schedule for, or null to publish now. A time that has already
+ * passed (the row was picked up late) publishes now rather than failing.
+ */
+export function effectiveSchedule(scheduledAt: string | null, now = Date.now()): string | null {
+  if (!scheduledAt) return null;
+  const t = Date.parse(scheduledAt);
+  return Number.isNaN(t) || t <= now ? null : scheduledAt;
 }
 
 export type MediaRef =
   | { kind: "storage"; bucket: string; path: string; filename: string }
-  | { kind: "url"; url: string; filename: string };
+  | { kind: "url"; url: string; filename: string }
+  | { kind: "library"; id: number };
 
-/** `storage:<bucket>/<path>` for this project's Storage, otherwise an http(s) URL. */
+/**
+ * `storage:<bucket>/<path>` for this project's Storage, `bulkpublish:<id>` for
+ * a file already in the BulkPublish media library, otherwise an http(s) URL.
+ */
 export function parseMediaRef(ref: string): MediaRef {
   const value = String(ref).trim();
+  const library = /^bulkpublish:(\d+)$/i.exec(value);
+  if (library) return { kind: "library", id: Number(library[1]) };
   const storage = /^storage:\/{0,2}([^/]+)\/(.+)$/i.exec(value);
   if (storage) {
     const path = storage[2];
@@ -279,7 +323,7 @@ export function parseMediaRef(ref: string): MediaRef {
   try {
     url = new URL(value);
   } catch {
-    throw new RowError(`Media "${value}" is not a URL. Use https://… or storage:<bucket>/<path>.`);
+    throw new RowError(`Media "${value}" is not a URL. Use https://…, storage:<bucket>/<path> or bulkpublish:<media id>.`);
   }
   if (url.protocol !== "https:" && url.protocol !== "http:") {
     throw new RowError(`Media "${value}" must be an http(s) URL or storage:<bucket>/<path>.`);
@@ -344,7 +388,7 @@ function destinations(post: Json): DestinationResult[] {
  * Read a BulkPublish post back into a row update. Called right after a post is
  * created, and again on each check until the row settles.
  */
-export function outcomeFor(post: Json, now = Date.now()): RowUpdate {
+export function outcomeFor(post: Json, now = Date.now(), claimedAt: string | null = null): RowUpdate {
   const id = post?.id;
   const dests = destinations(post);
 
@@ -353,7 +397,8 @@ export function outcomeFor(post: Json, now = Date.now()): RowUpdate {
       status: "pending_approval",
       result: `Waiting for a teammate to approve post ${id} at ${APP_POSTS_URL}.`,
       post_urls: dests,
-      next_check_at: minutesFrom(now, 10),
+      // Each check is one API request; approval can take a day.
+      next_check_at: minutesFrom(now, 60),
     };
   }
   if (post?.approvalStatus === "rejected") {
@@ -368,8 +413,10 @@ export function outcomeFor(post: Json, now = Date.now()): RowUpdate {
   if (post?.status === "draft") {
     return {
       status: "failed",
-      result: `Post ${id} was approved after its time had passed, so it was not published. ` +
-        `Choose a new time for it at ${APP_POSTS_URL}.`,
+      result: post?.approvalStatus === "approved"
+        ? `Post ${id} was approved after its time had passed, so it was not published. ` +
+          `Choose a new time for it at ${APP_POSTS_URL}.`
+        : `Post ${id} is a draft in BulkPublish and was not published. Publish it from ${APP_POSTS_URL}.`,
       post_urls: dests,
       next_check_at: null,
     };
@@ -396,11 +443,15 @@ export function outcomeFor(post: Json, now = Date.now()): RowUpdate {
   }
   const pending = dests.filter((d) => PENDING.has(d.status));
   if (!dests.length || pending.length) {
+    // Each check is one API request. Most posts settle within minutes; one
+    // held back by a network's own daily limit can take hours.
+    const claimed = claimedAt ? Date.parse(claimedAt) : NaN;
+    const ageMinutes = Number.isNaN(claimed) ? 0 : (now - claimed) / 60_000;
     return {
       status: "posting",
       result: `Publishing post ${id}…`,
       post_urls: dests,
-      next_check_at: minutesFrom(now, 0.5),
+      next_check_at: minutesFrom(now, ageMinutes < 10 ? 0.5 : ageMinutes < 60 ? 5 : 30),
     };
   }
 
@@ -432,4 +483,29 @@ export function safeEqual(a: string, b: string): boolean {
   let diff = x.length ^ y.length;
   for (let i = 0; i < Math.max(x.length, y.length); i++) diff |= (x[i] ?? 0) ^ (y[i] ?? 0);
   return diff === 0;
+}
+
+/** Midnight UTC after `now`, when the daily API request allowance resets. */
+export function nextUtcMidnight(now = Date.now()): string {
+  const d = new Date(now);
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1, 0, 1)).toISOString();
+}
+
+/**
+ * The key the function uses to reach its own database. New projects provide
+ * SUPABASE_SECRET_KEYS (JSON, keyed by name); older ones the legacy
+ * SUPABASE_SERVICE_ROLE_KEY.
+ */
+export function serverKey(get: (name: string) => string | undefined): string | null {
+  const keys = get("SUPABASE_SECRET_KEYS");
+  if (keys) {
+    try {
+      const parsed = JSON.parse(keys);
+      const key = parsed?.default ?? Object.values(parsed || {})[0];
+      if (typeof key === "string" && key) return key;
+    } catch {
+      // fall through to the legacy key
+    }
+  }
+  return get("SUPABASE_SERVICE_ROLE_KEY") || null;
 }

@@ -93,6 +93,20 @@ select vault.create_secret('<the secret from step 3>', 'bulkpublish_webhook_secr
 
 That's it. Insert a row with `status = 'ready'` to test it.
 
+To change either value later, use `vault.update_secret` (secret names are
+unique, so running `create_secret` again fails):
+
+```sql
+select vault.update_secret(
+  (select id from vault.secrets where name = 'bulkpublish_webhook_secret'),
+  '<new secret>');
+```
+
+The shared secret travels in a request header, which the database keeps in
+its outgoing request queue for a short while. Treat it as a project secret,
+and change it if you share database access with someone who should not call
+the function.
+
 ## Columns
 
 You write these:
@@ -101,8 +115,8 @@ You write these:
 |---|---|---|
 | `caption` | text | The post text. Checked against each network's length limit before anything is sent (X 280, Bluesky 300, Threads 500, LinkedIn 3000, Instagram and TikTok 2200, and so on). |
 | `channels` | text[] | Where to post. Each value is a network name (`x`, `linkedin`, `gmb` for Google Business Profile), which means every connected account on that network; an account name; a channel id; or the name of a channel set you saved in BulkPublish. |
-| `media` | text[] | Optional images, videos or documents, up to 100 MB each. Use `storage:<bucket>/<path>` for a file in this project's Storage, or any public `https://` URL. |
-| `scheduled_at` | timestamptz | Optional. Empty publishes now; a future time schedules the post. |
+| `media` | text[] | Optional images, videos or documents. Use `storage:<bucket>/<path>` for a file in this project's Storage or any public `https://` URL (up to 50 MB each), or `bulkpublish:<media id>` for a file already in your BulkPublish media library (any size it accepts; use this for long videos). |
+| `scheduled_at` | timestamptz | Optional. Empty publishes now; a future time schedules the post. A time that has already passed by the time the row is picked up publishes now. |
 | `timezone` | text | Optional IANA zone shown on the post in BulkPublish, such as `America/New_York`. |
 | `request_approval` | boolean | Hold the post until a teammate approves it in BulkPublish. Without a time it publishes as soon as it is approved. |
 | `discord_channel` | text | For Discord: the text channel to post in, by name (`#announcements`) or id. Can be left empty if the Discord connection has a default channel. |
@@ -112,7 +126,7 @@ These are written back for you:
 
 | Column | Meaning |
 |---|---|
-| `status` | `posting` → `posted`, `partial` (some networks failed), or `failed`. Also `scheduled` and `pending_approval`, which move on by themselves once the time comes or the post is approved. |
+| `status` | `posting` → `posted`, `partial` (some networks failed), or `failed`. Also `scheduled` and `pending_approval`, which move on by themselves once the time comes or the post is approved, and `retrying` (see below). |
 | `result` | The post URLs, one per line, or the error. Errors name the network and say what to change. |
 | `post_urls` | The same per network, as JSON: `[{ "platform", "channelId", "status", "url", "error" }]`. |
 | `bulkpublish_post_id` | The post in BulkPublish, which you can open at [app.bulkpublish.com/posts](https://app.bulkpublish.com/posts). |
@@ -163,17 +177,40 @@ no other columns.
 ## Good to know
 
 - **A row is never posted twice by accident.** Setting a row to `ready` claims
-  it once, however many times the function is called. To post the same thing
-  again, set it back to `ready` after it finished, or insert a new row.
+  it once, however many times the function is called. While a row is
+  `posting`, `retrying`, `scheduled` or `pending_approval`, setting it to
+  `ready` is refused with an error, since that would make a second post. Once
+  it has finished (`posted`, `partial` or `failed`) you can set it to `ready`
+  to send it again. To re-send one that is still in progress anyway, set it
+  to `draft` first.
 - **If something goes wrong between creating the post and hearing back,** the
   row is marked `failed` with a note to check BulkPublish first, rather than
   being retried, since the post may already be live.
 - **Plan limits apply.** Rows count toward your BulkPublish plan's posts and
   storage like any other post. If a limit is reached, the row fails with the
   reason.
+- **API requests.** Each row uses about three API requests (reading your
+  channels, creating the post, publishing it), plus one per file it uploads,
+  plus one each time its result is read back: usually once or twice, then
+  less often for a post that takes long, and once an hour while it waits for
+  approval. The free plan's 10 requests a day are enough to try it with a
+  post or two; paid plans allow 1,000 or more a day. See
+  [pricing](https://www.bulkpublish.com/pricing/).
+- **Passing errors are retried.** If BulkPublish is briefly unreachable or
+  busy before a post is created, the row shows `retrying` and is tried again a
+  minute later, up to five times in all. Running out of the day's API requests
+  is not retried; the row fails and says so.
+- **Rows that never settle stop being checked after 14 days** (for example a
+  post nobody approves), with a note pointing to the post in BulkPublish.
+- **Editing a row after it was sent does not change the post.** Change a
+  scheduled post in BulkPublish itself, or delete it there and set the row to
+  `ready` again.
 - **Roles.** If your API key belongs to a team member who needs approval to
   publish, rows fail with a note to set `request_approval`.
 - **Logs** are under Edge Functions → `bulkpublish` → Logs in the dashboard.
+- **Database key.** The function reaches your table with the server key
+  Supabase gives every function (`SUPABASE_SECRET_KEYS`, or
+  `SUPABASE_SERVICE_ROLE_KEY` on older projects). There is nothing to set.
 - **Stopping it:** `select cron.unschedule('bulkpublish-sweep');` and
   `drop trigger bulkpublish_posts_on_ready on public.bulkpublish_posts;`.
 
@@ -186,6 +223,13 @@ npm run test:sql   # runs both migrations against a throwaway local Postgres
 
 `npm run test:sql` creates and drops its own database. Point it somewhere
 else with `PGURL=postgres://user@host:5432`.
+
+To try the whole thing locally with `supabase start`, serve the function with
+`supabase functions serve bulkpublish --no-verify-jwt`, set
+`[edge_runtime] policy = "per_worker"` in `supabase/config.toml` (otherwise
+the local runtime stops work that continues after the response), and store
+`http://host.docker.internal:54321/functions/v1/bulkpublish` as the
+`bulkpublish_function_url` Vault secret.
 
 ## Support
 
