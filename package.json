@@ -1,0 +1,24 @@
+{
+  "name": "supabase-bulkpublish",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Publish and schedule social posts to 15 networks from a Supabase table, through BulkPublish",
+  "type": "module",
+  "scripts": {
+    "test": "node --experimental-strip-types --no-warnings --test test/*.test.ts",
+    "test:sql": "bash test/sql.sh"
+  },
+  "engines": {
+    "node": ">=22.6"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/azeemkafridi/supabase-bulkpublish",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/azeemkafridi/supabase-bulkpublish"
+  },
+  "author": {
+    "name": "BulkPublish",
+    "url": "https://bulkpublish.com"
+  }
+}

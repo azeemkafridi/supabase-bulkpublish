@@ -1,0 +1,4 @@
+# The function checks its own shared secret (x-bulkpublish-secret), because
+# the database calls it without a user's JWT.
+[functions.bulkpublish]
+verify_jwt = false
