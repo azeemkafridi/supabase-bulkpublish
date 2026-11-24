@@ -224,12 +224,28 @@ npm run test:sql   # runs both migrations against a throwaway local Postgres
 `npm run test:sql` creates and drops its own database. Point it somewhere
 else with `PGURL=postgres://user@host:5432`.
 
-To try the whole thing locally with `supabase start`, serve the function with
-`supabase functions serve bulkpublish --no-verify-jwt`, set
-`[edge_runtime] policy = "per_worker"` in `supabase/config.toml` (otherwise
-the local runtime stops work that continues after the response), and store
-`http://host.docker.internal:54321/functions/v1/bulkpublish` as the
-`bulkpublish_function_url` Vault secret.
+To run the whole thing locally against a stand-in API (needs Docker and the
+Supabase CLI):
+
+```bash
+node test/e2e/mock-api.mjs            # stand-in API on :8787, key bp_test_key
+supabase start                        # applies both migrations
+printf 'BULKPUBLISH_API_KEY=bp_test_key\nBULKPUBLISH_WEBHOOK_SECRET=local-secret\nBULKPUBLISH_BASE_URL=http://host.docker.internal:8787\n' > supabase/functions/.env
+supabase functions serve bulkpublish --no-verify-jwt --env-file supabase/functions/.env
+```
+
+Then, in `psql postgresql://postgres:postgres@127.0.0.1:54322/postgres`:
+
+```sql
+select vault.create_secret('http://host.docker.internal:54321/functions/v1/bulkpublish', 'bulkpublish_function_url');
+select vault.create_secret('local-secret', 'bulkpublish_webhook_secret');
+insert into bulkpublish_posts (caption, channels, status) values ('Hello', '{x, linkedin}', 'ready');
+```
+
+The stand-in API answers like the real one. A caption containing `XFAIL`
+makes X refuse the post, `NOROLE` refuses publishing for lack of a role,
+`GET /__fail429?n=2` refuses the next two requests, and `GET /__approve/<post id>`
+approves a held post. `GET /__log` lists every request it received.
 
 ## Support
 
